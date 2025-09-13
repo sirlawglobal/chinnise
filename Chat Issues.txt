@@ -1,0 +1,1160 @@
+import 'dart:convert';
+import 'dart:developer';
+import 'dart:io';
+import 'package:dio/dio.dart';
+import 'package:dkonect/chats_helper/notification_helper.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:stomp_dart_client/stomp_dart_client.dart';
+import 'package:dkonect/dio/api_helper.dart';
+import 'package:dkonect/dio/dio.dart';
+import 'package:dkonect/modals/error_dialog.dart';
+
+import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as p;
+
+class ChatService with ChangeNotifier {
+  static final ChatService _instance = ChatService._internal();
+  factory ChatService() => _instance;
+  ChatService._internal();
+  //final List<ChatItem> _chatItems = [];
+  final Dio _dio = DioClient().dio;
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
+  StompClient? _stompClient;
+  bool _isConnected = false;
+  final List<Map<String, dynamic>> _messages = [];
+  bool _isLoading = false;
+  bool _hasMoreMessages = true;
+  bool get hasMoreMessages => _hasMoreMessages;
+
+  String? _currentChatUserId;
+
+  // int _dailyMessageCount = 0;
+  // bool _hasReachedLimit = false;
+
+  // int get dailyMessageCount => _dailyMessageCount;
+  // bool get hasReachedLimit => _hasReachedLimit;
+
+  void setCurrentChatUserId(String? userId) {
+    _currentChatUserId = userId;
+  }
+
+  void Function(Map<String, dynamic> message)? onIncomingMessage;
+
+  bool get isConnected => _isConnected;
+  List<Map<String, dynamic>> get messages => _messages;
+  bool get isLoading => _isLoading;
+
+  Future<void> fetchAllMessages({
+    required String senderId,
+    required String receiverId,
+    int page = 0,
+    int size = 20,
+    bool append = false,
+  }) async {
+    if (_isLoading) return;
+
+    _isLoading = true;
+    notifyListeners();
+
+    try {
+      final response = await _dio.get(
+        "/messaging/chats",
+        queryParameters: {
+          "senderId": senderId,
+          "receiverId": receiverId,
+          "page": page,
+          "size": size,
+        },
+      );
+
+      final List<dynamic> data = response.data["object"];
+
+      final newMessages = data.map((msg) {
+        final messageMap = {
+          'senderId': msg['senderId'],
+          'receiverId': msg['receiverId'],
+          'message': msg['message'],
+          'timestamp': msg['dateCreated'],
+          'chatStatus': msg['chatStatus'],
+          'chatType': msg['chatType'] ??
+              (msg['senderId'] == senderId ? 'SENDER' : 'RECEIVER'),
+          'chatId': msg['chatId'],
+          'isDeleted': msg['deleted'] ?? false,
+        };
+
+        if (msg['fileUrl'] != null) {
+          messageMap['fileUrl'] = msg['fileUrl'];
+        }
+
+        return messageMap;
+      }).toList();
+
+      if (!append) _messages.clear();
+      if (append) {
+        _messages.insertAll(0, newMessages);
+      } else {
+        _messages.addAll(newMessages);
+      }
+
+      if (newMessages.length < size) {
+        _hasMoreMessages = false;
+      }
+    } catch (e) {
+      log("Pagination fetch error: $e");
+    } finally {
+      _isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  void clearMessages() {
+    _messages.clear();
+    notifyListeners();
+  }
+
+  void addTemporaryMessage(Map<String, dynamic> message) {
+    _messages.add(message);
+    notifyListeners();
+  }
+
+  // Future<Map<String, dynamic>?> sendMessage({
+  //   required BuildContext context,
+  //   required String senderId,
+  //   required String receiverId,
+  //   required String message,
+  //   File? file,
+  //   String? tempId,
+  // }) async {
+  //   try {
+  //     File? processedFile = file;
+
+  //     if (file != null) {
+  //       final fileSizeInBytes = await file.length();
+  //       final fileSizeInMB = fileSizeInBytes / (1024 * 1024 * 3);
+
+  //       final isImage = ['.jpg', '.jpeg', '.png', '.webp']
+  //           .contains(p.extension(file.path).toLowerCase());
+
+  //       if (fileSizeInMB > 1 && isImage) {
+  //         // Compress the image
+  //         final tempDir = await getTemporaryDirectory();
+  //         final targetPath =
+  //             p.join(tempDir.path, "compressed_${p.basename(file.path)}");
+
+  //         final compressedFile = await FlutterImageCompress.compressAndGetFile(
+  //           file.absolute.path,
+  //           targetPath,
+  //           quality: 70, // Adjust for more/less compression
+  //         );
+
+  //         if (compressedFile != null) {
+  //           final newSize = await compressedFile.length();
+  //           if (newSize < fileSizeInBytes) {
+  //             processedFile = File(compressedFile.path);
+  //           }
+  //         }
+  //       } else if (fileSizeInMB > 1 && !isImage) {
+  //         // Non-image (e.g. video or other files)
+  //         showErrorDialog(context,
+  //             "The selected file exceeds the 1MB size limit and can't be compressed.");
+  //         return null;
+  //       }
+  //     }
+
+  //     FormData formData = FormData.fromMap({
+  //       "senderId": senderId,
+  //       "receiverId": receiverId,
+  //       "message": message,
+  //       if (file != null)
+  //         "file": await MultipartFile.fromFile(file.path,
+  //             filename: p.basename(file.path)),
+  //     });
+  //     final dio = Dio(BaseOptions(
+  //       baseUrl: "https://api.develop.dkonect.com",
+  //       contentType: 'multipart/form-data',
+  //     ));
+  //     final response = await dio.post(
+  //       "/auth/messaging",
+  //       data: formData,
+  //       options: Options(contentType: "multipart/form-data"),
+  //     );
+
+  //     final responseData = response.data;
+
+  //     final realMessage = {
+  //       'chatId': responseData['chatId'],
+  //       'senderId': senderId,
+  //       'receiverId': receiverId,
+  //       'message': message,
+  //       'timestamp': DateTime.parse(responseData['dateCreated'])
+  //           .toLocal()
+  //           .toIso8601String(),
+  //       'chatStatus': 'SENT',
+  //       'chatType': 'SENDER',
+  //       'fileUrl': responseData['fileUrl'],
+  //     };
+
+  //     // Replace temp message
+  //     if (tempId != null) {
+  //       final index = _messages.indexWhere((m) => m['chatId'] == tempId);
+  //       if (index != -1) {
+  //         _messages[index] = realMessage;
+  //       } else {
+  //         _messages.add(realMessage);
+  //       }
+  //     } else {
+  //       _messages.add(realMessage);
+  //     }
+
+  //     notifyListeners();
+  //     return realMessage;
+  //   } catch (e) {
+  //     log("Error sending message: $e");
+  //     if (tempId != null) {
+  //       final index = _messages.indexWhere((m) => m['chatId'] == tempId);
+  //       if (index != -1) {
+  //         _messages[index]['chatStatus'] = 'FAILED';
+  //         notifyListeners();
+  //       }
+  //     }
+  //     return null;
+  //   }
+  // }
+
+  Future<Map<String, dynamic>?> sendMessage({
+    required BuildContext context,
+    required String senderId,
+    required String receiverId,
+    required String message,
+    File? file,
+    String? tempId,
+  }) async {
+    // if (_hasReachedLimit) {
+    //   showErrorDialog(context,
+    //       "You’ve reached your free daily message limit. Upgrade to continue chatting.");
+    //   return null;
+    // }
+
+    try {
+      File? processedFile = file;
+
+      // (keep your existing file compression logic here...)
+
+      FormData formData = FormData.fromMap({
+        "senderId": senderId,
+        "receiverId": receiverId,
+        "message": message,
+        if (file != null)
+          "file": await MultipartFile.fromFile(file.path,
+              filename: p.basename(file.path)),
+      });
+
+      final dio = Dio(BaseOptions(
+        baseUrl: "https://api.develop.dkonect.com",
+        contentType: 'multipart/form-data',
+      ));
+
+      final response = await dio.post(
+        "/auth/messaging",
+        data: formData,
+        options: Options(contentType: "multipart/form-data"),
+      );
+
+      final responseData = response.data;
+
+      // ✅ Increase count if successful
+      // _dailyMessageCount++;
+      // if (_dailyMessageCount >= 10) {
+      //   // example: 10 free messages per day
+      //   _hasReachedLimit = true;
+      // }
+
+      final realMessage = {
+        'chatId': responseData['chatId'],
+        'senderId': senderId,
+        'receiverId': receiverId,
+        'message': message,
+        'timestamp': DateTime.parse(responseData['dateCreated'])
+            .toLocal()
+            .toIso8601String(),
+        'chatStatus': 'SENT',
+        'chatType': 'SENDER',
+        'fileUrl': responseData['fileUrl'],
+      };
+
+      if (tempId != null) {
+        final index = _messages.indexWhere((m) => m['chatId'] == tempId);
+        if (index != -1) {
+          _messages[index] = realMessage;
+        } else {
+          _messages.add(realMessage);
+        }
+      } else {
+        _messages.add(realMessage);
+      }
+
+      notifyListeners();
+      return realMessage;
+      // } on DioError catch (e) {
+      //   final errorMsg = e.response?.data["message"] ?? "Error sending message";
+      //   if (errorMsg.contains("Daily free message limit")) {
+      //     _hasReachedLimit = true;
+      //     notifyListeners();
+      //     showErrorDialog(context,
+      //         "You’ve reached your free daily message limit. Upgrade to continue chatting.");
+      //   }
+      //   return null;
+    } catch (e) {
+      log("Error sending message: $e");
+      if (tempId != null) {
+        final index = _messages.indexWhere((m) => m['chatId'] == tempId);
+        if (index != -1) {
+          _messages[index]['chatStatus'] = 'FAILED';
+          notifyListeners();
+        }
+      }
+      return null;
+    }
+  }
+
+  Future<void> editMessage(String chatId, String newMessage) async {
+    try {
+      await makeApiRequest(
+        '/messaging/chat/edit',
+        'POST',
+        data: {
+          "chatId": chatId,
+          "newMessage": newMessage,
+        },
+      );
+      // Update the message's status locally.
+      final index = _messages.indexWhere((msg) => msg['chatId'] == chatId);
+      if (index != -1) {
+        _messages[index]['chatStatus'] = 'SENT';
+        notifyListeners();
+      }
+    } catch (e) {
+      log("Error marking message as read: $e");
+    }
+  }
+
+  Future<void> deleteMessage(String chatId) async {
+    try {
+      await makeApiRequest(
+        '/messaging/delete/$chatId',
+        'DELETE',
+      );
+
+      final index = _messages.indexWhere((msg) => msg['chatId'] == chatId);
+      if (index != -1) {
+        _messages[index]['isDeleted'] = true;
+        _messages[index]['message'] = 'This message was deleted';
+        _messages[index]['fileUrl'] = null;
+
+        notifyListeners();
+      }
+    } catch (e) {
+      log("Failed to delete message: $e");
+    }
+  }
+
+  void updateEditedMessage(String chatId, String newMessage) {
+    // Find the index of the message with the given chatId
+    final index = _messages.indexWhere((msg) => msg['chatId'] == chatId);
+    if (index != -1) {
+      // Update the message content
+      _messages[index]['message'] = newMessage;
+      _messages[index]['isEdited'] = true;
+
+      // Optionally, update timestamp to reflect edit time
+      _messages[index]['editedAt'] = DateTime.now().toUtc().toIso8601String();
+
+      // Notify listeners so the UI updates
+      notifyListeners();
+    }
+  }
+
+  Future<void> markMessageAsRead(String chatId) async {
+    try {
+      print("i have been called");
+      await _dio.put(
+        "/messaging/markAsRead",
+        queryParameters: {'chatId': chatId},
+      );
+      // Update the message's status locally.
+      final index = _messages.indexWhere((msg) => msg['chatId'] == chatId);
+      if (index != -1) {
+        _messages[index]['chatStatus'] = 'READ'; // Change status to READ
+        notifyListeners();
+      }
+    } catch (e) {
+      log("Error marking message as read: $e");
+    }
+  }
+
+  // ========== Connecting to WebSocket ==========
+  Future<void> connectWebSocket() async {
+    if (_isConnected) return; // Prevent duplicate connections
+
+    final accessToken = await _secureStorage.read(key: 'accessToken');
+    final userId = await _secureStorage.read(key: 'userId');
+
+    if (accessToken == null || userId == null) {
+      log('No access token or user id found, skipping WebSocket connection.');
+      return;
+    }
+
+    log('Connecting to WebSocket...');
+
+    _stompClient = StompClient(
+      config: StompConfig.sockJS(
+        url: "https://api.develop.dkonect.com/bloggios",
+        webSocketConnectHeaders: {
+          'Authorization': 'Bearer $accessToken',
+          'userId': userId,
+          'remoteAddress': "127.0.0.1",
+        },
+        onConnect: _onConnected,
+        onDisconnect: (frame) {
+          _isConnected = false;
+          notifyListeners();
+          log('WebSocket disconnected.');
+        },
+        onWebSocketError: (dynamic error) {
+          log('WebSocket error: $error');
+        },
+      ),
+    );
+
+    _stompClient!.activate();
+  }
+
+  void _onConnected(StompFrame frame) async {
+    final userId = await _secureStorage.read(key: 'userId');
+    _isConnected = true;
+
+    // Ensure this runs after the current frame is built
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      notifyListeners();
+    });
+
+    log('WebSocket connected!');
+
+    _stompClient!.subscribe(
+      destination: "/user/$userId/private/chat",
+      callback: (StompFrame frame) {
+        if (frame.body != null) {
+          final Map<String, dynamic> message = jsonDecode(frame.body!);
+
+          // Normalize dateCreated if it's a timestamp
+          final dc = message['dateCreated'];
+          if (dc is int) {
+            final dt = DateTime.fromMillisecondsSinceEpoch(dc, isUtc: true);
+            message['dateCreated'] =
+                dt.toUtc().toIso8601String().replaceFirst('Z', '+00:00');
+          }
+
+          // Add a 'timestamp' field for consistency
+          message['timestamp'] = message['dateCreated'];
+
+          // ✅ Handle the incoming message centrally
+          handleIncomingMessage(message);
+
+          log("Received message: $message");
+
+          // If external callback is set, call it too
+          if (onIncomingMessage != null) {
+            onIncomingMessage!(message);
+          }
+
+          WidgetsBinding.instance
+              .addPostFrameCallback((_) => notifyListeners());
+        }
+      },
+    );
+  }
+
+  void handleIncomingMessage(Map<String, dynamic> message) {
+    final chatId = message['chatId'];
+    final senderName = message['senderName'] ?? 'New message'; // fallback
+    final messageText = message['message'] ?? '';
+
+    final senderId = message['senderId'];
+
+    // ✅ Show local notification
+    // NotificationHelper.showNotification(
+    //   title: senderName,
+    //   body: messageText,
+    // );
+
+    // ✅ Show notification only if user is not actively chatting with sender
+    if (_currentChatUserId != senderId) {
+      NotificationHelper.showNotification(
+        title: senderName,
+        body: messageText,
+      );
+    }
+
+    final index = _messages.indexWhere((msg) => msg['chatId'] == chatId);
+
+    if (index != -1) {
+      if (message['isDeleted'] == true) {
+        _messages[index]['isDeleted'] = true;
+        _messages[index]['message'] = 'This message was deleted';
+        _messages[index]['fileUrl'] = null;
+      } else {
+        _messages[index] = {
+          ..._messages[index],
+          ...message, // for edits or updates
+        };
+      }
+      notifyListeners();
+    } else {
+      _messages.add(message);
+      notifyListeners();
+    }
+  }
+
+//   // ========== Handling WebSocket Reconnection ==========
+  Future<void> reconnectWebSocket() async {
+    if (_stompClient != null) {
+      _stompClient!.deactivate();
+    }
+    await connectWebSocket();
+  }
+
+  // ========== Disconnecting from WebSocket ==========
+
+  void disconnectWebSocket() {
+    _stompClient?.deactivate();
+    _isConnected = false;
+
+    // Ensure notifyListeners() is safe to call
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      notifyListeners();
+    });
+
+    log('WebSocket disconnected manually.');
+  }
+}
+
+
+
+
+import 'package:dkonect/chat/chat_state.dart';
+import 'package:flutter/material.dart';
+import 'package:dkonect/dio/api_helper.dart';
+import 'package:dkonect/model/chat_item_model.dart';
+
+
+class ChatListProvider with ChangeNotifier {
+  List<ChatItem> _chatItems = [];
+
+
+  List<ChatItem> get chatItems => _chatItems;
+
+  bool isLoading = false;
+
+  Future<void> fetchChatList(String userId, int page) async {
+    isLoading = true;
+    notifyListeners();
+
+    try {
+      final url = '/chat-history/list?userId=$userId&page=$page';
+      final response = await makeApiRequest(url, 'GET');
+
+      final data = response.data;
+      print(response);
+      final List chatList = data['object'];
+
+      _chatItems = chatList.map((json) => ChatItem.fromJson(json)).toList();
+    } catch (e) {
+      print("Error fetching chat list: $e");
+    }
+
+    isLoading = false;
+    notifyListeners();
+  }
+
+  // You can also add this if you want to manually update
+  void updateChatItem(ChatItem newItem) {
+    final index = _chatItems.indexWhere((item) => item.userId == newItem.userId);
+    if (index != -1) {
+      _chatItems[index] = newItem;
+    } else {
+      _chatItems.insert(0, newItem);
+    }
+
+    notifyListeners();
+  }
+
+void handleIncomingMessage(Map<String, dynamic> message) async{
+  
+  final senderId = message['senderId'];
+  final index = _chatItems.indexWhere((item) => item.userId == senderId);
+  final bool isUserCurrentlyViewing = ChatState.currentChatUserId == senderId;
+
+
+  if (index != -1) {
+    final oldItem = _chatItems[index];
+    final updated = oldItem.copyWith(
+  lastMessage: message['message'],
+  lastMessageTime: message['dateCreated'],
+   unreadCount: isUserCurrentlyViewing ?0  : oldItem.unreadCount + 1,
+    );
+
+
+    _chatItems.removeAt(index);
+    _chatItems.insert(0, updated); // move to top
+  } else {
+   
+     final userInfo = await fetchUserProfile(senderId);
+final List<dynamic>? imageLinks = userInfo?['imageLinks'];
+final String profileImage = (imageLinks != null && imageLinks.isNotEmpty)
+    ? imageLinks[0]['link']
+    : "https://as1.ftcdn.net/v2/jpg/00/64/67/52/1000_F_64675209_7ve2XQANuzuHjMZXP3aIYIpsDKEbF5dD.jpg";
+
+    final newItem = ChatItem(
+      userId: senderId,
+      nickname: userInfo?['nickname'] ?? "Unknown",
+      firstname: userInfo?['firstname'] ?? '',
+      lastname: userInfo?['lastname'] ?? '',
+      lastMessage: message['message'],
+      lastMessageTime: message['dateCreated'],
+      unreadCount: isUserCurrentlyViewing ? 0 : 1,
+      
+      profilePictureUrl: profileImage
+    );
+
+    _chatItems.insert(0, newItem);
+
+  
+  }
+
+  notifyListeners();
+}
+
+
+Future<Map<String, dynamic>?> fetchUserProfile(String userId) async {
+  try {
+    final response = await makeApiRequest(
+      '/profile/list', // Or your correct endpoint path
+      'POST',
+      data: {
+        "filters": [
+          {"filterKey": "userId", "selections": [userId]}
+        ],
+        "sorts": [],
+        "search": [],
+        "searchFilters": [],
+        "absoluteFilters": [],
+        "page": 0,
+        "size": 1
+      },
+    );
+
+    final users = response.data['object'];
+    if (users != null && users.isNotEmpty) {
+      return users.first;
+    }
+  } catch (e) {
+    print("Error fetching user profile: $e");
+  }
+
+  return null;
+}
+
+void handleOutgoingMessage({
+  required String receiverId,
+  required String message,
+  required String timestamp,
+  required String nickname,
+  required String firstname,
+  required String lastname,
+  required String profileImage,
+}) {
+  final index = _chatItems.indexWhere((item) => item.userId == receiverId);
+
+  final newItem = ChatItem(
+    userId: receiverId,
+    nickname: nickname,
+    firstname: firstname,
+    lastname: lastname,
+    lastMessage: message,
+    lastMessageTime: timestamp,
+    unreadCount: 0,
+    profilePictureUrl: profileImage,
+  );
+
+  if (index != -1) {
+    _chatItems.removeAt(index);
+  }
+
+  _chatItems.insert(0, newItem);
+  notifyListeners();
+}
+
+void markUserAsRead(String userId) {
+  final index = _chatItems.indexWhere((item) => item.userId == userId);
+  if (index != -1) {
+    final updated = _chatItems[index].copyWith(unreadCount: 0);
+    _chatItems[index] = updated;
+    notifyListeners();
+  }
+}
+
+}
+
+
+
+
+On the profile
+body: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16.0),
+        child: SizedBox(
+          height: screenHeight * 0.75,
+          width: double.infinity,
+          child: PageView.builder(
+            controller: _pageController,
+            itemCount: totalItems,
+            scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
+            onPageChanged: _onPageChanged,
+            itemBuilder: (context, index) {
+              if ((index + 1) % adPosition == 0) {
+                if (adsList.isEmpty) {
+                  return const Center(child: Text('No ads available'));
+                }
+                final adIndex = (index ~/ adPosition) % adsList.length;
+                return AdCard(
+                    ad: adsList[adIndex], pageController: _pageController);
+              } else {
+                final profileIndex = index - (index ~/ adPosition);
+                if (profileIndex < profiles.length) {
+                  final profile = profiles[profileIndex];
+                  final name = profile.nickname ?? "Unknown";
+                  final city = profile.city ?? "Unknown";
+                  final countryy = profile.country ?? "Unknown";
+                  final age = profile.age ?? "N/A";
+                  final photo = profile.imageUrl ?? "";
+                  final id = profile.userId ?? "N/A";
+                  bool showLocation = (profile.showLocation ?? true) &&
+                      (profileProvider.getLocation ?? true);
+                  double latitude = profile.latitude ?? 0;
+                  double longitude = profile.longitude ?? 0;
+                  double distance = calculateDistance(
+                      latitudeMe, longitudeMe, latitude, longitude);
+
+                  return GestureDetector(
+                    onHorizontalDragEnd: (details) {
+                      if (details.primaryVelocity == null) return;
+
+                      if (details.primaryVelocity! < 0) {
+                        _pageController.nextPage(
+                          duration: const Duration(milliseconds: 300),
+                          curve: Curves.easeInOut,
+                        );
+                      } else if (details.primaryVelocity! > 0) {
+                        _pageController.previousPage(
+                          duration: const Duration(milliseconds: 300),
+                          curve: Curves.easeInOut,
+                        );
+                      }
+                    },
+                    onTap: () async {
+                      final visitProvider =
+                          Provider.of<VisitProvider>(context, listen: false);
+                      await visitProvider.createVisit(context, 'VISIT', id);
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                            builder: (context) =>
+                                UserProfilePage(profile: profile)),
+                      );
+                    },
+                    child: Stack(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(15),
+                          child: Image.network(
+                            (photo.isEmpty || photo == "null") ? '' : photo,
+                            fit: BoxFit.cover,
+                            width: double.infinity,
+                            height: double.infinity,
+                            errorBuilder: (context, error, stackTrace) {
+                              return Image.network(
+                                fallback,
+                                fit: BoxFit.cover,
+                                width: double.infinity,
+                                height: double.infinity,
+                              );
+                            },
+                            loadingBuilder: (context, child, loadingProgress) {
+                              if (loadingProgress == null) return child;
+                              return Image.network(
+                                fallback,
+                                fit: BoxFit.cover,
+                                width: double.infinity,
+                                height: double.infinity,
+                              );
+                            },
+                          ),
+                        ),
+                        if (_showActionOverlay)
+                          Positioned.fill(
+                            child: Center(
+                              child: Text(
+                                _actionText,
+                                style: TextStyle(
+                                  fontFamily: font,
+                                  fontSize: screenWidth * 0.06,
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                        if (_showCancel)
+                          Positioned.fill(
+                            child: Center(
+                              child: Opacity(
+                                opacity: _showCancel ? 1.0 : 0.0,
+                                child: Text(
+                                  'Recent Action Reversed',
+                                  style: TextStyle(
+                                    fontFamily: font,
+                                    fontSize: screenWidth * 0.06,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ..._hearts,
+                        Positioned(
+                          bottom: 0,
+                          child: Container(
+                            width: screenWidth * 0.93,
+                            padding: EdgeInsets.symmetric(
+                                vertical: screenHeight * 0.01,
+                                horizontal: screenHeight * 0.02),
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(15),
+                              color: Colors.black.withOpacity(0.4),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisAlignment: MainAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.center,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          name,
+                                          style: TextStyle(
+                                            fontFamily: font,
+                                            color: Colors.white,
+                                            fontSize: screenWidth * 0.06,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                        Text(
+                                          ' , $age',
+                                          style: TextStyle(
+                                            fontFamily: font,
+                                            color: Colors.white,
+                                            fontSize: screenWidth * 0.05,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    if (showLocation)
+                                      Row(
+                                        children: [
+                                          Text(
+                                            '${distance.toStringAsFixed(2)} ${translator.t("km_away")}',
+                                            style: TextStyle(
+                                                fontFamily: font,
+                                                color: Colors.white,
+                                                fontSize: screenWidth * 0.03),
+                                          ),
+                                        ],
+                                      ),
+                                    if (showLocation)
+                                      Row(
+                                        children: [
+                                          const Icon(Icons.location_on,
+                                              size: 20, color: Colors.white),
+                                          Text(
+                                            city,
+                                            style: TextStyle(
+                                              fontFamily: font,
+                                              color: Colors.white,
+                                              fontSize: screenWidth * 0.04,
+                                              fontWeight: FontWeight.w200,
+                                            ),
+                                          ),
+                                          Text(
+                                            ' , $countryy',
+                                            style: TextStyle(
+                                              fontFamily: font,
+                                              color: Colors.white,
+                                              fontSize: screenWidth * 0.04,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    SizedBox(height: screenWidth * 0.02),
+                                  ],
+                                ),
+                                Padding(
+                                  padding: EdgeInsets.symmetric(
+                                      horizontal: screenWidth * 0.02),
+                                  child: Row(
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceEvenly,
+                                    children: [
+                                      GestureDetector(
+                                        onTap: () {
+                                          if (profileProvider.getPackageType ==
+                                              "FREE") {
+                                            Navigator.pushNamed(
+                                                context, upgradePlan);
+                                          } else {
+                                            _onCancelPressed(context);
+                                          }
+                                        },
+                                        child: Container(
+                                          width: 40,
+                                          height: 40,
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            gradient: LinearGradient(
+                                              colors: [
+                                                Colors.black,
+                                                Color.fromARGB(255, 34, 78, 35),
+                                                Color.fromARGB(255, 39, 65, 40),
+                                                Colors.black,
+                                              ],
+                                              begin: Alignment.topLeft,
+                                              end: Alignment.bottomRight,
+                                            ),
+                                          ),
+                                          child: const Center(
+                                            child: Icon(Icons.refresh,
+                                                color: Colors.white, size: 30),
+                                          ),
+                                        ),
+                                      ),
+                                      const Spacer(),
+                                      InkWell(
+                                        onTap: () {
+                                          _showHeartss(
+                                            context,
+                                            'LIKE',
+                                            id,
+                                            Icons.favorite_outline,
+                                            [
+                                              const Color.fromARGB(
+                                                  255, 25, 90, 29),
+                                              const Color.fromARGB(
+                                                  255, 44, 207, 49),
+                                              const Color.fromARGB(
+                                                  255, 25, 90, 29),
+                                            ],
+                                            0.1,
+                                          );
+                                        },
+                                        child: Container(
+                                          width: 40,
+                                          height: 40,
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            gradient: LinearGradient(
+                                              colors: [
+                                                Color.fromARGB(255, 25, 90, 29),
+                                                Color.fromARGB(
+                                                    255, 44, 207, 49),
+                                                Color.fromARGB(255, 25, 90, 29),
+                                              ],
+                                              begin: Alignment.topLeft,
+                                              end: Alignment.bottomRight,
+                                            ),
+                                          ),
+                                          child: const Center(
+                                            child: Icon(Icons.favorite_outline,
+                                                color: Colors.white, size: 30),
+                                          ),
+                                        ),
+                                      ),
+                                      const Spacer(),
+                                      GestureDetector(
+                                        onTap: () {
+                                          _showHeartss(
+                                            context,
+                                            'SUPERLIKE',
+                                            id,
+                                            Icons.favorite_outline,
+                                            [
+                                              const Color.fromARGB(
+                                                  255, 180, 38, 28),
+                                              Colors.red,
+                                              Colors.red,
+                                              const Color.fromARGB(
+                                                  255, 177, 34, 24),
+                                            ],
+                                            0.3,
+                                          );
+                                        },
+                                        child: Container(
+                                          width: 40,
+                                          height: 40,
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            gradient: LinearGradient(
+                                              colors: [
+                                                Color.fromARGB(
+                                                    255, 180, 38, 28),
+                                                Colors.red,
+                                                Colors.red,
+                                                Color.fromARGB(
+                                                    255, 177, 34, 24),
+                                              ],
+                                              begin: Alignment.topLeft,
+                                              end: Alignment.bottomRight,
+                                            ),
+                                          ),
+                                          child: const Center(
+                                            child: Icon(Icons.favorite_rounded,
+                                                color: Colors.white, size: 30),
+                                          ),
+                                        ),
+                                      ),
+                                      const Spacer(),
+                                      GestureDetector(
+                                        onTap: () => _onActionPressed(
+                                            context, 'DISLIKE', -0.4, id),
+                                        child: Container(
+                                          width: 40,
+                                          height: 40,
+                                          decoration: const BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            gradient: LinearGradient(
+                                              colors: [
+                                                Colors.white,
+                                                Colors.white,
+                                                Color.fromARGB(
+                                                    255, 123, 128, 123),
+                                                Colors.white,
+                                                Colors.white,
+                                              ],
+                                              begin: Alignment.topLeft,
+                                              end: Alignment.bottomRight,
+                                            ),
+                                          ),
+                                          child: const Center(
+                                            child: Icon(Icons.close_rounded,
+                                                color: Color.fromARGB(
+                                                    255, 3, 119, 7),
+                                                size: 30),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          top: 10,
+                          right: 10,
+                          child: IconButton(
+                            icon: const Icon(Icons.more_horiz,
+                                color: Colors.white, size: 30),
+                            onPressed: () {
+                              showSmallPopup(context, id, name);
+                            },
+                          ),
+                        ),
+                        Positioned(
+                          bottom: screenHeight * 0.2,
+                          right: 10,
+                          child: InkWell(
+                            onTap: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (context) => ChatScreen(
+                                    name: name,
+                                    id: id,
+                                    profilePhoto: photo,
+                                  ),
+                                ),
+                              );
+                            },
+                            child: CachedNetworkImage(
+                              imageUrl:
+                                  'https://res.cloudinary.com/dtuvbxzpy/image/upload/v1750410509/imessage_woecmc.png',
+                              placeholder: (context, url) =>
+                                  const CircularProgressIndicator(
+                                color: blue,
+                              ),
+                              errorWidget: (context, error, stackTrace) =>
+                                  const Icon(Icons.broken_image),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                } else if (_isFetching) {
+                  return const Center(
+                      child: CircularProgressIndicator(color: blue));
+                } else {
+                  return const Center(child: Text('No more profiles'));
+                }
+              }
+            },
+          ),
+        ),
+      ),
+    );
+
+
+
+CHAT LIST
+
+Expanded(
+                  child: chatProvider.isLoading
+                      ? const Center(child: CircularProgressIndicator())
+                      : ListView.builder(
+                          itemCount: chatList.length,
+                          itemBuilder: (context, index) {
+                            final chat = chatList[index];
+                            return chatItem(
+                              context,
+                              index: index,
+                              id: chat.userId,
+                              name: chat.nickname,
+                              message: chat.lastMessage,
+                              imagePath: chat.profilePictureUrl ??
+                                  "https://as1.ftcdn.net/v2/jpg/00/64/67/52/1000_F_64675209_7ve2XQANuzuHjMZXP3aIYIpsDKEbF5dD.jpg",
+                              time: formatDateTime(chat.lastMessageTime),
+                              unreadCount: chat.unreadCount,
+                            );
+                          },
+                        ),

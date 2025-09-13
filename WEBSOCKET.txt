@@ -1,0 +1,481 @@
+package com.gn128.configuration;
+
+/*
+  Developer: Rohit Parihar
+  Project: gabriel-project
+  GitHub: github.com/rohit-zip
+  File: WebSocketConfiguration
+ */
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.converter.DefaultContentTypeResolver;
+import org.springframework.messaging.converter.MappingJackson2MessageConverter;
+import org.springframework.messaging.converter.MessageConverter;
+import org.springframework.messaging.simp.config.ChannelRegistration;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.messaging.simp.stomp.StompCommand;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.messaging.support.ChannelInterceptor;
+import org.springframework.util.MimeTypeUtils;
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+
+import java.util.List;
+
+@Configuration
+@EnableWebSocketMessageBroker
+@RequiredArgsConstructor
+public class WebSocketConfiguration implements WebSocketMessageBrokerConfigurer {
+
+    String[] allowedOrigins = {
+            "http://localhost:7001",
+            "https://bloggios.com"
+    };
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        registry.enableSimpleBroker("/user", "/notification");
+        registry.setApplicationDestinationPrefixes("/app");
+        registry.setUserDestinationPrefix("/user");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/bloggios")
+                .setAllowedOrigins(allowedOrigins)
+                .withSockJS();
+    }
+
+    @Override
+    public boolean configureMessageConverters(List<MessageConverter> messageConverters) {
+        DefaultContentTypeResolver resolver = new DefaultContentTypeResolver();
+        resolver.setDefaultMimeType(MimeTypeUtils.APPLICATION_JSON);
+        MappingJackson2MessageConverter converter = new MappingJackson2MessageConverter();
+        converter.setObjectMapper(new ObjectMapper());
+        converter.setContentTypeResolver(resolver);
+        messageConverters.add(converter);
+        return false;
+    }
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(new ChannelInterceptor() {
+            @Override
+            public Message<?> preSend(Message<?> message, MessageChannel channel) {
+                StompHeaderAccessor accessor = StompHeaderAccessor.wrap(message);
+                if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+                    String authHeader = accessor.getFirstNativeHeader("Authorization");
+                    if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                        accessor.setNativeHeader("accessToken", authHeader.substring(7));
+                    }
+                }
+                return message;
+            }
+        });
+    }
+}
+
+
+/*
+ * Copyright © 2023-2024 Rohit Parihar and Bloggios
+ * All rights reserved.
+ * This software is the property of Rohit Parihar and is protected by copyright law.
+ * The software, including its source code, documentation, and associated files, may not be used, copied, modified, distributed, or sublicensed without the express written consent of Rohit Parihar.
+ * For licensing and usage inquiries, please contact Rohit Parihar at rohitparih@gmail.com, or you can also contact support@bloggios.com.
+ * This software is provided as-is, and no warranties or guarantees are made regarding its fitness for any particular purpose or compatibility with any specific technology.
+ * For license information and terms of use, please refer to the accompanying LICENSE file or visit http://www.apache.org/licenses/LICENSE-2.0.
+ * Unauthorized use of this software may result in legal action and liability for damages.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.gn128.configuration;
+
+import com.gn128.websocket.WebSocketConnectExecutor;
+import com.gn128.websocket.WebSocketDisconnectExecutor;
+import lombok.RequiredArgsConstructor;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.simp.stomp.StompCommand;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.messaging.support.ChannelInterceptor;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Component;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Owner - Rohit Parihar
+ * Author - rohit
+ * Project - bloggios-websockets-provider
+ * Package - com.bloggios.websockets.provider.configurations
+ * Created_on - 29 February-2024
+ * Created_at - 13 : 41
+ */
+
+@Component
+@RequiredArgsConstructor
+public class WebsocketChannelInterceptor implements ChannelInterceptor {
+
+    private final WebSocketConnectExecutor webSocketConnectExecutor;
+    private final WebSocketDisconnectExecutor webSocketDisconnectExecutor;
+
+    @Override
+    public Message<?> preSend(Message<?> message, MessageChannel channel) {
+        StompHeaderAccessor accessor = StompHeaderAccessor.wrap(message);
+        System.out.println(accessor.toString());
+        Map<String, List<String>> nativeHeaders = accessor.toNativeHeaderMap();
+        Message<?> filteredMessage = message;
+
+        if (nativeHeaders != null && nativeHeaders.containsKey(null)) {
+            StompHeaderAccessor newAccessor = StompHeaderAccessor.create(accessor.getCommand());
+
+            nativeHeaders.entrySet().stream()
+                    .filter(entry -> entry.getKey() != null)
+                    .forEach(entry -> entry.getValue().forEach(value ->
+                            newAccessor.addNativeHeader(entry.getKey(), value))
+                    );
+
+            newAccessor.setSessionId(accessor.getSessionId());
+            newAccessor.setUser(accessor.getUser());
+            newAccessor.setSessionAttributes(accessor.getSessionAttributes());
+            newAccessor.setDestination(accessor.getDestination());
+
+            filteredMessage = MessageBuilder.createMessage(
+                    message.getPayload(),
+                    newAccessor.getMessageHeaders()
+            );
+            accessor = StompHeaderAccessor.wrap(filteredMessage); // Update accessor
+        }
+
+
+        if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+            webSocketConnectExecutor.process(accessor);
+        } else if (StompCommand.DISCONNECT.equals(accessor.getCommand())) {
+            webSocketDisconnectExecutor.process(accessor);
+        }
+
+        return filteredMessage;
+    }
+}
+
+
+package com.gn128.configuration;
+
+/*
+  Developer: Rohit Parihar
+  Project: gabriel-project
+  GitHub: github.com/rohit-zip
+  File: WebSocketConfiguration
+ */
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.MessageChannel;
+import org.springframework.messaging.converter.DefaultContentTypeResolver;
+import org.springframework.messaging.converter.MappingJackson2MessageConverter;
+import org.springframework.messaging.converter.MessageConverter;
+import org.springframework.messaging.simp.config.ChannelRegistration;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.messaging.simp.stomp.StompCommand;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.messaging.support.ChannelInterceptor;
+import org.springframework.util.MimeTypeUtils;
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+
+import java.util.List;
+
+@Configuration
+@EnableWebSocketMessageBroker
+@RequiredArgsConstructor
+public class WebSocketConfiguration implements WebSocketMessageBrokerConfigurer {
+
+    String[] allowedOrigins = {
+            "http://localhost:7001",
+            "https://bloggios.com"
+    };
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+        registry.enableSimpleBroker("/user", "/notification");
+        registry.setApplicationDestinationPrefixes("/app");
+        registry.setUserDestinationPrefix("/user");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/bloggios")
+                .setAllowedOrigins(allowedOrigins)
+                .withSockJS();
+    }
+
+    @Override
+    public boolean configureMessageConverters(List<MessageConverter> messageConverters) {
+        DefaultContentTypeResolver resolver = new DefaultContentTypeResolver();
+        resolver.setDefaultMimeType(MimeTypeUtils.APPLICATION_JSON);
+        MappingJackson2MessageConverter converter = new MappingJackson2MessageConverter();
+        converter.setObjectMapper(new ObjectMapper());
+        converter.setContentTypeResolver(resolver);
+        messageConverters.add(converter);
+        return false;
+    }
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(new ChannelInterceptor() {
+            @Override
+            public Message<?> preSend(Message<?> message, MessageChannel channel) {
+                StompHeaderAccessor accessor = StompHeaderAccessor.wrap(message);
+                if (StompCommand.CONNECT.equals(accessor.getCommand())) {
+                    String authHeader = accessor.getFirstNativeHeader("Authorization");
+                    if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                        accessor.setNativeHeader("accessToken", authHeader.substring(7));
+                    }
+                }
+                return message;
+            }
+        });
+    }
+}
+
+
+/*
+ * Copyright © 2023-2024 Rohit Parihar and Bloggios
+ * All rights reserved.
+ * This software is the property of Rohit Parihar and is protected by copyright law.
+ * The software, including its source code, documentation, and associated files, may not be used, copied, modified, distributed, or sublicensed without the express written consent of Rohit Parihar.
+ * For licensing and usage inquiries, please contact Rohit Parihar at rohitparih@gmail.com, or you can also contact support@bloggios.com.
+ * This software is provided as-is, and no warranties or guarantees are made regarding its fitness for any particular purpose or compatibility with any specific technology.
+ * For license information and terms of use, please refer to the accompanying LICENSE file or visit http://www.apache.org/licenses/LICENSE-2.0.
+ * Unauthorized use of this software may result in legal action and liability for damages.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.gn128.websocket;
+
+import com.gn128.constants.ServiceConstants;
+import com.gn128.exception.payloads.AuthenticationException;
+import com.gn128.processor.PersistConnectedUserProcessor;
+import com.gn128.utils.WebSocketTokenValidation;
+import lombok.RequiredArgsConstructor;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.stereotype.Component;
+
+import javax.servlet.http.HttpServletRequest;
+import java.util.Objects;
+
+/**
+ * Owner - Rohit Parihar
+ * Author - rohit
+ * Project - bloggios-websockets-provider
+ * Package - com.bloggios.websockets.provider.processor.executor
+ * Created_on - 01 March-2024
+ * Created_at - 13 : 28
+ */
+
+@Component
+@RequiredArgsConstructor
+public class WebSocketConnectExecutor {
+
+    private final WebSocketTokenValidation webSocketTokenValidation;
+    private final PersistConnectedUserProcessor persistConnectedUserProcessor;
+
+    public void process(StompHeaderAccessor stompHeaderAccessor) {
+
+
+        String accessToken = stompHeaderAccessor.getFirstNativeHeader("accessToken");
+        if (accessToken == null) {
+            String authHeader = stompHeaderAccessor.getFirstNativeHeader("Authorization");
+            if (authHeader != null && authHeader.startsWith("Bearer ")) {
+                accessToken = authHeader.substring(7);
+            }
+        }
+
+
+
+        String userId = stompHeaderAccessor.getFirstNativeHeader(ServiceConstants.USER_ID);
+        String remoteAddress = stompHeaderAccessor.getFirstNativeHeader(ServiceConstants.REMOTE_ADDRESS);
+
+        System.out.println("Extracted token: " + (accessToken != null ? "[exists]" : "null"));
+        System.out.println("Extracted userId: " + userId);
+
+
+        System.out.println(userId);
+        System.out.println(accessToken);
+        if (Objects.isNull(userId)) throw new AuthenticationException("User Id not present for websocket authentication");
+        if (Objects.isNull(accessToken)) throw new AuthenticationException("Access token not present for websocket authentication");
+        webSocketTokenValidation.validate(accessToken, userId);
+        String sessionId = stompHeaderAccessor.getSessionId();
+        remoteAddress = Objects.nonNull(remoteAddress) ? remoteAddress : "defaultRemote";
+        persistConnectedUserProcessor.process(sessionId, userId, remoteAddress);
+
+        System.out.println(userId);
+    }
+}
+
+
+/*
+ * Copyright © 2023-2024 Rohit Parihar and Bloggios
+ * All rights reserved.
+ * This software is the property of Rohit Parihar and is protected by copyright law.
+ * The software, including its source code, documentation, and associated files, may not be used, copied, modified, distributed, or sublicensed without the express written consent of Rohit Parihar.
+ * For licensing and usage inquiries, please contact Rohit Parihar at rohitparih@gmail.com, or you can also contact support@bloggios.com.
+ * This software is provided as-is, and no warranties or guarantees are made regarding its fitness for any particular purpose or compatibility with any specific technology.
+ * For license information and terms of use, please refer to the accompanying LICENSE file or visit http://www.apache.org/licenses/LICENSE-2.0.
+ * Unauthorized use of this software may result in legal action and liability for damages.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.gn128.websocket;
+
+import com.gn128.processor.PersistDisconnectedUserProcessor;
+import lombok.RequiredArgsConstructor;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
+import org.springframework.stereotype.Component;
+
+import java.util.Objects;
+
+/**
+ * Owner - Rohit Parihar
+ * Author - rohit
+ * Project - bloggios-websockets-provider
+ * Package - com.bloggios.websockets.provider.processor.executor
+ * Created_on - 01 March-2024
+ * Created_at - 13 : 29
+ */
+
+@Component
+@RequiredArgsConstructor
+public class WebSocketDisconnectExecutor {
+
+    private final PersistDisconnectedUserProcessor persistDisconnectedUserProcessor;
+
+    public void process(StompHeaderAccessor stompHeaderAccessor) {
+        String sessionId = stompHeaderAccessor.getSessionId();
+        if (Objects.nonNull(sessionId)) {
+            persistDisconnectedUserProcessor.process(sessionId);
+        }
+    }
+}
+
+
+/*
+ * Copyright © 2023-2024 Rohit Parihar and Bloggios
+ * All rights reserved.
+ * This software is the property of Rohit Parihar and is protected by copyright law.
+ * The software, including its source code, documentation, and associated files, may not be used, copied, modified, distributed, or sublicensed without the express written consent of Rohit Parihar.
+ * For licensing and usage inquiries, please contact Rohit Parihar at rohitparih@gmail.com, or you can also contact support@bloggios.com.
+ * This software is provided as-is, and no warranties or guarantees are made regarding its fitness for any particular purpose or compatibility with any specific technology.
+ * For license information and terms of use, please refer to the accompanying LICENSE file or visit http://www.apache.org/licenses/LICENSE-2.0.
+ * Unauthorized use of this software may result in legal action and liability for damages.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.gn128.utils;
+
+import com.gn128.exception.payloads.AuthenticationException;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.oauth2.core.OAuth2Error;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.JwtValidationException;
+import org.springframework.stereotype.Component;
+
+import java.util.Collection;
+
+/**
+ * Owner - Rohit Parihar
+ * Author - rohit
+ * Project - bloggios-websockets-provider
+ * Package - com.bloggios.websockets.provider.processor.implementation.independent
+ * Created_on - 01 March-2024
+ * Created_at - 13 : 44
+ */
+
+@Component
+@RequiredArgsConstructor
+public class WebSocketTokenValidation {
+
+    private final JwtDecoderUtil jwtDecoderUtil;
+    private final JwtDecoder jwtDecoder;
+
+    public void validate(String accessToken, String userId) {
+        ValueCheckerUtil.isValidUUID(userId);
+        validateToken(accessToken);
+        String userIdFromToken = jwtDecoderUtil.extractUserId(accessToken);
+        if (!userIdFromToken.equals(userId)) {
+            throw new AuthenticationException("Token invalid");
+        }
+    }
+
+    private void validateToken(String accessToken) {
+        try {
+            jwtDecoder.decode(accessToken);
+        } catch (JwtValidationException exception) {
+            Collection<OAuth2Error> errors = exception.getErrors();
+            boolean isExpired = false;
+            for (OAuth2Error error : errors) {
+                if (error.getDescription().contains("expired")) {
+                    isExpired = true;
+                    break;
+                }
+            }
+            String errorCode = isExpired ? "Token Expired" : "Invalid token";
+            throw new AuthenticationException(errorCode);
+        } catch (Exception exception) {
+            throw new AuthenticationException("Invalid Token");
+        }
+    }
+}

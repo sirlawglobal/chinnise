@@ -1,0 +1,680 @@
+package com.gn128.service.implementation;
+
+/*
+  Developer: Rohit Parihar
+  Project: gabriel-project
+  GitHub: github.com/rohit-zip
+  File: ChatServiceImplementation
+ */
+
+import com.gn128.authentication.UserPrincipal;
+import com.gn128.constants.BeanNameConstants;
+import com.gn128.constants.EnvironmentConstants;
+import com.gn128.constants.ServiceConstants;
+import com.gn128.dao.repository.BlockRepository;
+import com.gn128.dao.repository.ChatRepository;
+import com.gn128.dao.repository.ConnectedUserRepository;
+import com.gn128.dao.repository.UserAuthRepository;
+import com.gn128.entity.Chat;
+import com.gn128.entity.ConnectedUser;
+import com.gn128.entity.UserAuth;
+import com.gn128.entity.embeddable.ImageLinks;
+import com.gn128.enums.ChatStatus;
+import com.gn128.enums.ChatType;
+import com.gn128.exception.payloads.BadRequestException;
+import com.gn128.file.UploadFile;
+import com.gn128.payloads.record.MessageRecord;
+import com.gn128.payloads.record.UploadImagePayloadRecord;
+import com.gn128.payloads.response.ModuleResponse;
+import com.gn128.payloads.response.ReadReceiptRecord;
+import com.gn128.processor.ChatHistoryCreateOrUpdateProcessor;
+import com.gn128.processor.UploadImagesLinkProcessor;
+import com.gn128.service.ChatService;
+import com.gn128.utils.AsyncUtils;
+import com.gn128.websocket.MessageExecutor;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.env.Environment;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.File;
+import java.io.IOException;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ChatServiceImplementation implements ChatService {
+
+    private final UserAuthRepository userAuthRepository;
+    private final BlockRepository blockRepository;
+    private final UploadFile uploadFile;
+    private final ConnectedUserRepository connectedUserRepository;
+    private final ChatRepository chatRepository;
+    private final ChatHistoryCreateOrUpdateProcessor chatHistoryCreateOrUpdateProcessor;
+    private final MessageExecutor messageExecutor;
+    private final UploadImagesLinkProcessor uploadImagesLinkProcessor;
+    private final Environment environment;
+
+
+
+
+    public static String generateChatKey(String userId1, String userId2) {
+        List<String> sorted = Arrays.asList(userId1, userId2);
+        Collections.sort(sorted); // Alphabetical or UUID sort
+        return sorted.get(0) + "_" + sorted.get(1);
+    }
+
+@Override
+@Async(BeanNameConstants.ASYNC_TASK_EXTERNAL_POOL)
+
+public CompletableFuture<ModuleResponse> sendPrivateMessage(MultipartFile file, String senderId, String receiverId, String message) {
+    CompletableFuture<UserAuth> receiverIdFuture = CompletableFuture.supplyAsync(() ->
+            userAuthRepository.findById(receiverId)
+                    .orElseThrow(() -> new BadRequestException("Receiver not found for the user")));
+
+    CompletableFuture<UserAuth> senderIdFuture = CompletableFuture.supplyAsync(() ->
+            userAuthRepository.findById(senderId)
+                    .orElseThrow(() -> new BadRequestException("Sender not found for the user")));
+
+    CompletableFuture<Optional<ConnectedUser>> optionalConnectedUserFuture = CompletableFuture.supplyAsync(() ->
+            connectedUserRepository.findById(receiverId));
+
+    AsyncUtils.getAsyncResult(CompletableFuture.allOf(receiverIdFuture, senderIdFuture, optionalConnectedUserFuture));
+
+    UserAuth receiverUser = receiverIdFuture.join();
+    UserAuth senderUser = senderIdFuture.join();
+    Optional<ConnectedUser> connectedUserOptional = optionalConnectedUserFuture.join();
+// ✅ Block check: Don't allow blocked users to send messages
+    boolean isBlocked = blockRepository.existsByBlockerUserIdAndBlockedUserId(receiverId, senderId);
+    if (isBlocked) {
+        log.warn("Blocked user {} attempted to message {}", senderId, receiverId);
+        return CompletableFuture.completedFuture(
+                ModuleResponse.builder()
+                        .userId(senderId)
+                        .id(receiverId)
+                        .message("Message not delivered. You have been blocked by this user.")
+                        .build()
+        );
+    }
+//remove above if error
+    ChatStatus chatStatus = connectedUserOptional.isPresent() ? ChatStatus.DELIVERED : ChatStatus.SENT;
+
+    String chatId = UUID.randomUUID().toString();
+    String fileUrl = null;
+
+    if (file != null && !file.isEmpty()) {
+        try {
+            // ✅ Use UploadImagePayloadRecord for consistent file saving
+            UploadImagePayloadRecord uploadImagePayloadRecord = new UploadImagePayloadRecord(
+                    environment.getProperty(EnvironmentConstants.CHAT_IMAGES_PATH), // Same as PROFILE_IMAGES_PATH in addUserImages
+                    senderId,
+                    List.of(file),
+                    ServiceConstants.UPLOAD_CHAT // Use a constant similar to UPLOAD_PROFILE for clarity
+            );
+
+            List<ImageLinks> uploadedLinks = uploadImagesLinkProcessor.process(uploadImagePayloadRecord);
+
+            if (!uploadedLinks.isEmpty()) {
+                fileUrl = uploadedLinks.get(0).getLink(); // We assume only one file for chat
+            } else {
+                log.warn("No file URL returned from uploadImagesLinkProcessor");
+            }
+
+        } catch (RuntimeException e) {
+            log.error("File upload failed", e);
+        }
+    } else {
+        log.warn("File was null or empty");
+    }
+
+    Chat chatDocument = Chat.builder()
+            .chatId(chatId)
+            .chatKey(generateChatKey(senderUser.getUserId(), receiverUser.getUserId()))
+            .senderId(senderUser.getUserId())
+            .receiverId(receiverUser.getUserId())
+            .message(message)
+            .fileUrl(fileUrl)
+            .dateCreated(Date.from(Instant.now()))
+            .chatStatus(chatStatus)
+            .deliveredOn(chatStatus == ChatStatus.DELIVERED ? Date.from(Instant.now()) : null)
+            .build();
+
+    CompletableFuture.runAsync(() -> {
+        Chat savedChat = chatRepository.save(chatDocument);
+        chatHistoryCreateOrUpdateProcessor.process(savedChat);
+    }).exceptionally(ex -> {
+        log.error("Error saving chat message", ex);
+        return null;
+    });
+
+    String senderNickname = senderUser.getUsername();
+
+    messageExecutor.sendPrivateMessage(new MessageRecord(
+            chatDocument.getSenderId(),
+            chatDocument.getReceiverId(),
+            chatDocument.getMessage(),
+            chatDocument.getDateCreated(),
+            chatDocument.getFileUrl(),
+            chatDocument.getChatId(),
+            chatDocument.getChatStatus(),
+            false,
+            false,
+            senderNickname
+    ));
+
+    log.debug("Message sent successfully to {}", chatDocument.getReceiverId());
+
+    return CompletableFuture.completedFuture(
+            ModuleResponse.builder()
+                    .userId(senderId)
+                    .id(receiverId)
+                    .chatId(chatDocument.getChatId())
+                    .message("Message Sent")
+                    .fileUrl(fileUrl)
+                    .dateCreated(chatDocument.getDateCreated())
+
+                    .build()
+    );
+}
+
+
+    @Override
+    public ModuleResponse editPrivateMessage( String chatId, String newMessage, UserPrincipal userPrincipal) {
+        String senderId = userPrincipal.getUserId();
+        Chat chat = chatRepository.findById(chatId)
+                .orElseThrow(() -> new BadRequestException("Chat message not found"));
+
+        if (!chat.getSenderId().equals(senderId)) {
+            throw new BadRequestException("You can only edit your own messages.");
+        }
+
+        chat.setMessage(newMessage);
+
+        chatRepository.save(chat);
+
+        String senderNickname = userAuthRepository.findById(senderId)
+                .map(UserAuth::getUsername)
+                .orElse("Unknown");
+
+        // Notify the receiver about the edited message
+        messageExecutor.sendPrivateMessage(new MessageRecord(
+                chat.getSenderId(),
+                chat.getReceiverId(),
+                chat.getMessage(),
+                chat.getDateCreated(),
+                chat.getFileUrl(),
+                chat.getChatId(),
+                chat.getChatStatus(),
+                true,
+                false,
+                senderNickname
+        ));
+
+        return ModuleResponse.builder()
+                .userId(senderId)
+                .id(chat.getReceiverId())
+                .message("Message Edited Successfully")
+                .build();
+    }
+
+
+    @Override
+    public ModuleResponse deletePrivateMessage( String chatId, UserPrincipal userPrincipal) {
+        String senderId = userPrincipal.getUserId();
+
+
+        Chat chat = chatRepository.findById(chatId)
+                .orElseThrow(() -> new BadRequestException("Chat message not found"));
+
+        if (!chat.getSenderId().equals(senderId)) {
+            throw new BadRequestException("You can only delete your own messages.");
+        }
+
+        chat.setDeleted(true); // Mark as deleted
+        chat.setMessage("This message has been deleted.");
+        chat.setFileUrl(null);
+        chatRepository.save(chat);
+
+        String senderNickname = userAuthRepository.findById(senderId)
+                .map(UserAuth::getUsername)
+                .orElse("Unknown");
+
+        // Notify the receiver that the message is deleted
+        messageExecutor.sendPrivateMessage(new MessageRecord(
+                chat.getSenderId(),
+                chat.getReceiverId(),
+                chat.getMessage(), // Or you can send `null` if frontend prefers
+                chat.getDateCreated(),
+                chat.getFileUrl(), // optional: can nullify this too
+                chat.getChatId(),
+                ChatStatus.DELETED,
+                false,
+                true,
+                senderNickname
+        ));
+
+        return ModuleResponse.builder()
+                .userId(senderId)
+                .id(chat.getReceiverId())
+                .message("Message deleted successfully.")
+                .build();
+    }
+public long countUnreadMessagesForUser(String userId) {
+        return chatRepository.countByReceiverIdAndChatStatus(userId, ChatStatus.SENT);
+    }
+@Override
+@Transactional
+public ModuleResponse markMessageAsRead(String chatId) {
+    // Find the chat message by ID
+    Optional<Chat> chat = chatRepository.findById(chatId);
+
+    // If the chat is present, mark it as read
+    if (chat.isPresent()) {
+        Chat message = chat.get();
+        // Only update the message status if it's not already read
+        if (message.getChatStatus() != ChatStatus.READ) {
+            message.setChatStatus(ChatStatus.READ);
+            message.setReadOn(new Date()); // Set the read time
+            chatRepository.save(message);  // Save the updated message to the database
+
+            // Send a read receipt notification to the sender
+            messageExecutor.sendReadReceipt(new ReadReceiptRecord(
+                    message.getSenderId(), message.getReceiverId(), chatId
+            ));
+        }
+        // Return success response
+        return ModuleResponse.builder()
+                .message("Message marked as read")
+                .build();
+    } else {
+        // Return error response if the message is not found
+        return ModuleResponse.builder()
+                .message("Message not found")
+                .build();
+    }
+}
+}
+
+CHAT REPOSITORY
+package com.gn128.dao.repository;
+
+/*
+  Developer: Rohit Parihar
+  Project: gabriel-project
+  GitHub: github.com/rohit-zip
+  File: ChatRepository
+ */
+
+import com.gn128.entity.Chat;
+import com.gn128.enums.ChatStatus;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+
+public interface ChatRepository extends JpaRepository<Chat, String> {
+    Page<Chat> findAllByChatKey(String chatKey, Pageable pageable);
+    @Query("SELECT c FROM Chat c WHERE c.chatKey LIKE %:userId% ORDER BY c.dateCreated DESC")
+    List<Chat> findAllUserChats(@Param("userId") String userId);
+
+    Page<Chat> findAllByChatKeyIn(List<String> chatKeys, Pageable pageable);
+    List<Chat> findAllBySenderId(String senderId);
+    List<Chat> findAllByReceiverId(String receiverId);
+
+    // ✅ New delete methods
+    void deleteBySenderId(String senderId);
+    void deleteByReceiverId(String receiverId);
+
+    @Query("""
+SELECT c FROM Chat c
+WHERE (c.senderId = :userId1 AND c.receiverId = :userId2)
+   OR (c.senderId = :userId2 AND c.receiverId = :userId1)
+ORDER BY c.dateCreated DESC
+""")
+    List<Chat> findChatsBetweenUsers(@Param("userId1") String userId1, @Param("userId2") String userId2, Pageable pageable);
+    long countByReceiverIdAndChatStatus(String receiverId, ChatStatus chatStatus);
+    long countBySenderIdAndReceiverIdAndChatStatus(String senderId, String receiverId, ChatStatus chatStatus);
+    @Query(value = "SELECT DISTINCT c1.receiver_id " +
+            "FROM chat c1 " +
+            "JOIN chat c2 ON c1.receiver_id = c2.sender_id " +
+            "WHERE c1.sender_id = :userId AND c2.receiver_id = :userId",
+            nativeQuery = true)
+    Set<String> findMutualChatUserIds(@Param("userId") String userId);
+
+}
+
+
+CHAT CONTROLLER
+
+
+package com.gn128.controller;
+
+
+;
+import com.gn128.authentication.UserPrincipal;
+import com.gn128.payloads.request.EditMessageRequest;
+import com.gn128.payloads.response.ExceptionResponse;
+import com.gn128.payloads.response.ListResponse;
+import com.gn128.payloads.response.ModuleResponse;
+
+import com.gn128.service.ChatService;
+import com.gn128.service.UserChatService;
+import com.gn128.utils.AsyncUtils;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+import lombok.RequiredArgsConstructor;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.concurrent.CompletableFuture;
+
+
+/**
+/**
+ * Owner - Rohit Parihar
+ * Author - rohit
+ * Project - bloggios-websockets-provider
+ * Package - com.bloggios.websockets.provider.controller
+ * Created_on - 25 March-2024
+ * Created_at - 12 : 52
+ */
+
+@RestController
+@RequestMapping
+@RequiredArgsConstructor
+public class ChatController {
+
+    private final ChatService chatService;
+    private final UserChatService userChatService;
+
+    @PostMapping("/auth/messaging")
+    public ResponseEntity<ModuleResponse> sendPrivateMessage(
+            @RequestPart(required = false) MultipartFile file,
+            @RequestPart String senderId,
+            @RequestPart String receiverId,
+            @RequestPart String message
+            ) {
+        return ResponseEntity.ok(AsyncUtils.getAsyncResult(chatService.sendPrivateMessage(file, senderId, receiverId, message)));
+    }
+
+
+    @GetMapping("/messaging/chats")
+    public CompletableFuture<ResponseEntity<ListResponse>> getUserChats(
+            @RequestParam String senderId,
+            @RequestParam String receiverId,
+            @RequestParam Integer page,
+            @RequestParam Integer size
+    ) {
+        return userChatService.userChatList(receiverId, senderId, page, size)
+                .thenApply(ResponseEntity::ok);
+    }
+    @PutMapping("/messaging/markAsRead")
+    public ResponseEntity<ModuleResponse> markMessageAsRead(@RequestParam String chatId) {
+        ModuleResponse response = chatService.markMessageAsRead(chatId);
+
+        if ("Message marked as read".equals(response.getMessage())) {
+            return ResponseEntity.ok(response);
+        } else {
+            return ResponseEntity.status(404).body(response);
+        }
+    }
+    @PostMapping("/messaging/chat/edit")
+    @Operation(
+            summary = "Edit a private message",
+            responses = {
+                    @ApiResponse(description = "SUCCESS", responseCode = "200", content = @Content(
+                            mediaType = "application/json", schema = @Schema(implementation = ModuleResponse.class)
+                    )),
+                    @ApiResponse(description = "BAD REQUEST", responseCode = "400", content = @Content(
+                            mediaType = "application/json", schema = @Schema(implementation = ExceptionResponse.class)
+                    )),
+                    @ApiResponse(description = "UNAUTHORIZED", responseCode = "401"),
+                    @ApiResponse(description = "FORBIDDEN", responseCode = "403")
+            },
+            security = {
+                    @SecurityRequirement(name = "bearerAuth")
+            }
+    )
+    public ResponseEntity<ModuleResponse> editMessage(
+            @RequestBody EditMessageRequest request,
+            @AuthenticationPrincipal UserPrincipal userPrincipal
+    ) {
+        return ResponseEntity.ok(
+                chatService.editPrivateMessage(
+                        request.getChatId(),
+                        request.getNewMessage(),
+                        userPrincipal
+                )
+        );
+    }
+
+
+
+    @DeleteMapping("/messaging/delete/{chatId}")
+    @Operation(
+            summary = "Delete a private message",
+            responses = {
+                    @ApiResponse(description = "SUCCESS", responseCode = "200", content = @Content(
+                            mediaType = "application/json", schema = @Schema(implementation = ModuleResponse.class)
+                    )),
+                    @ApiResponse(description = "BAD REQUEST", responseCode = "400", content = @Content(
+                            mediaType = "application/json", schema = @Schema(implementation = ExceptionResponse.class)
+                    )),
+                    @ApiResponse(description = "UNAUTHORIZED", responseCode = "401"),
+                    @ApiResponse(description = "FORBIDDEN", responseCode = "403")
+            },
+            security = {
+                    @SecurityRequirement(name = "bearerAuth")
+            }
+    )
+    public ResponseEntity<ModuleResponse> deletePrivateMessage(
+            @PathVariable String chatId,
+            @AuthenticationPrincipal UserPrincipal userPrincipal
+    ) {
+
+        ModuleResponse response = chatService.deletePrivateMessage(chatId, userPrincipal);
+        return ResponseEntity.ok(response);
+    }
+
+}
+
+
+CHAT SERVICE
+
+/*
+ * Copyright © 2023-2024 Rohit Parihar and Bloggios
+ * All rights reserved.
+ * This software is the property of Rohit Parihar and is protected by copyright law.
+ * The software, including its source code, documentation, and associated files, may not be used, copied, modified, distributed, or sublicensed without the express written consent of Rohit Parihar.
+ * For licensing and usage inquiries, please contact Rohit Parihar at rohitparih@gmail.com, or you can also contact support@bloggios.com.
+ * This software is provided as-is, and no warranties or guarantees are made regarding its fitness for any particular purpose or compatibility with any specific technology.
+ * For license information and terms of use, please refer to the accompanying LICENSE file or visit http://www.apache.org/licenses/LICENSE-2.0.
+ * Unauthorized use of this software may result in legal action and liability for damages.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.gn128.service;
+
+import com.gn128.authentication.UserPrincipal;
+import com.gn128.entity.Chat;
+import com.gn128.payloads.response.ModuleResponse;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Owner - Rohit Parihar
+ * Author - rohit
+ * Project - bloggios-websockets-provider
+ * Package - com.bloggios.websockets.provider.service
+ * Created_on - 25 March-2024
+ * Created_at - 13 : 00
+ */
+
+public interface ChatService {
+    ModuleResponse markMessageAsRead(String chatId);
+    long countUnreadMessagesForUser(String userId);
+    ModuleResponse deletePrivateMessage( String chatId, UserPrincipal userPrincipal);
+    ModuleResponse editPrivateMessage(String chatId, String newMessage, UserPrincipal userPrincipal);
+    CompletableFuture<ModuleResponse> sendPrivateMessage(MultipartFile file, String senderId, String receiverId, String message);
+}
+
+CHAT HISTORY
+/*
+ * Copyright © 2023-2024 Rohit Parihar and Bloggios
+ * All rights reserved.
+ * This software is the property of Rohit Parihar and is protected by copyright law.
+ * The software, including its source code, documentation, and associated files, may not be used, copied, modified, distributed, or sublicensed without the express written consent of Rohit Parihar.
+ * For licensing and usage inquiries, please contact Rohit Parihar at rohitparih@gmail.com, or you can also contact support@bloggios.com.
+ * This software is provided as-is, and no warranties or guarantees are made regarding its fitness for any particular purpose or compatibility with any specific technology.
+ * For license information and terms of use, please refer to the accompanying LICENSE file or visit http://www.apache.org/licenses/LICENSE-2.0.
+ * Unauthorized use of this software may result in legal action and liability for damages.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.gn128.processor;
+
+import com.gn128.dao.repository.ChatHistoryRepository;
+import com.gn128.entity.Chat;
+import com.gn128.entity.ChatHistory;
+import com.gn128.transformer.ChatDocumentToChatHistoryTransformer;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.time.Instant;
+import java.util.Date;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Owner - Rohit Parihar
+ * Author - rohit
+ * Project - bloggios-websockets-provider
+ * Package - com.bloggios.websockets.provider.processor.implementation.voidprocess
+ * Created_on - 28 March-2024
+ * Created_at - 16 : 18
+ */
+
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class ChatHistoryCreateOrUpdateProcessor {
+
+    private final ChatHistoryRepository chatHistoryRepository;
+    private final ChatDocumentToChatHistoryTransformer chatDocumentToChatHistoryTransformer;
+    
+    public void process(Chat chat) {
+
+        CompletableFuture<Optional<ChatHistory>> optionalPrimaryChatHistory = CompletableFuture.supplyAsync(() -> chatHistoryRepository.findByUserIdAndReceiverId(chat.getSenderId(), chat.getReceiverId()));
+        CompletableFuture<Optional<ChatHistory>> optionalSecondaryChatHistory = CompletableFuture.supplyAsync(() -> chatHistoryRepository.findByUserIdAndReceiverId(chat.getReceiverId(), chat.getSenderId()));
+        CompletableFuture.allOf(optionalPrimaryChatHistory, optionalSecondaryChatHistory);
+        Optional<ChatHistory> primaryChat = optionalPrimaryChatHistory.join();
+        Optional<ChatHistory> secondaryChat = optionalSecondaryChatHistory.join();
+
+        if (primaryChat.isPresent() && secondaryChat.isPresent()) {
+            CompletableFuture<Void> primaryVoid = CompletableFuture.runAsync(() -> updateChatHistory(primaryChat));
+            CompletableFuture<Void> secondaryVoid = CompletableFuture.runAsync(() -> updateChatHistory(secondaryChat));
+            CompletableFuture.allOf(primaryVoid, secondaryVoid);
+        } else if (primaryChat.isEmpty() && secondaryChat.isEmpty()) {
+            ChatHistory primaryChatHistoryDocument = chatDocumentToChatHistoryTransformer.apply(chat);
+            ChatHistory secondaryChatHistoryDocument = chatDocumentToChatHistoryTransformer.apply(chat.getReceiverId(), chat.getSenderId());
+            CompletableFuture<Void> primaryFuture = CompletableFuture.runAsync(() -> createChatHistory(primaryChatHistoryDocument));
+            CompletableFuture<Void> secondaryFuture = CompletableFuture.runAsync(() -> createChatHistory(secondaryChatHistoryDocument));
+            CompletableFuture.allOf(primaryFuture, secondaryFuture);
+        } else if (primaryChat.isEmpty()) {
+            ChatHistory primaryChatHistoryDocument = chatDocumentToChatHistoryTransformer.apply(chat);
+            CompletableFuture<Void> primaryChatCreateFuture = CompletableFuture.runAsync(() -> createChatHistory(primaryChatHistoryDocument));
+            CompletableFuture<Void> secondaryChatUpdateFuture = CompletableFuture.runAsync(() -> updateChatHistory(secondaryChat));
+            CompletableFuture.allOf(primaryChatCreateFuture, secondaryChatUpdateFuture);
+            log.warn("""
+                    Data Redundancy Observed for Chat History
+                    Description : Primary Chat is not present but Secondary Chat is present
+                    Sender Id : {}
+                    Receiver Id : {}
+                    """,
+                    chat.getSenderId(),
+                    chat.getReceiverId());
+        } else {
+            ChatHistory secondaryChatHistoryDocument = chatDocumentToChatHistoryTransformer.apply(chat.getReceiverId(), chat.getSenderId());
+            CompletableFuture<Void> primaryChatUpdateFuture = CompletableFuture.runAsync(() -> updateChatHistory(primaryChat));
+            CompletableFuture<Void> secondaryChatCreateFuture = CompletableFuture.runAsync(() -> createChatHistory(secondaryChatHistoryDocument));
+            CompletableFuture.allOf(primaryChatUpdateFuture, secondaryChatCreateFuture);
+            log.warn("""
+                    Data Redundancy Observed for Chat History
+                    Description : Primary Chat is present but Secondary Chat is not present
+                    Sender Id : {}
+                    Receiver Id : {}
+                    """,
+                    chat.getSenderId(),
+                    chat.getReceiverId());
+        }
+    }
+
+    private void updateChatHistory(Optional<ChatHistory> history) {
+        if (history.isPresent()) {
+            ChatHistory chatHistory = history.get();
+            chatHistory.setUpdatedOn(Date.from(Instant.now()));
+            chatHistoryRepository.save(chatHistory);
+            log.debug("""
+                                Chat History window Updated for below details
+                                User Id : {}
+                                Sender Id : {}
+                            """,
+                    chatHistory.getUserId(),
+                    chatHistory.getReceiverId());
+        }
+    }
+
+    private void createChatHistory(ChatHistory chatHistory) {
+        ChatHistory response = chatHistoryRepository.save(chatHistory);
+        log.info("""
+                    Chat History window initialized for below details
+                    User Id : {}
+                    Sender Id : {}
+                    """,
+                response.getUserId(),
+                response.getReceiverId());
+    }
+}
+
